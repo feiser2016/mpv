@@ -268,10 +268,19 @@ in the mpv git repository.
 Mouse Control
 -------------
 
-button 3 and button 4
-    Seek backward/forward 1 minute.
+Left double click
+    Toggle fullscreen on/off.
 
-button 5 and button 6
+Right click
+    Toggle pause on/off.
+
+Forward/Back button
+    Skip to next/previous entry in playlist.
+
+Wheel up/down
+    Seek forward/backward 10 seconds.
+
+Wheel left/right
     Decrease/increase volume.
 
 
@@ -510,23 +519,6 @@ specifying the path to the local copy: ``--dvd-device=PATH``.
 Alternatively, running ``mpv PATH`` should auto-detect a DVD directory
 tree and play the longest title.
 
-.. note:: DVD library choices
-
-    mpv uses a different default DVD library than MPlayer. MPlayer
-    uses libdvdread by default, and mpv uses libdvdnav by default.
-    Both libraries are developed in parallel, but libdvdnav is
-    intended to support more sophisticated DVD features such as menus
-    and multi-angle playback. mpv uses libdvdnav for files specified
-    as either ``dvd://...`` or ``dvdnav://...``. To use libdvdread,
-    which will produce behavior more like MPlayer, specify
-    ``dvdread://...`` instead. Some users have experienced problems
-    when using libdvdnav, in which playback gets stuck in a DVD menu
-    stream. These problems are reported to go away when auto-selecting
-    the title (``dvd://`` rather than ``dvd://1``) or when using
-    libdvdread (e.g. ``dvdread://0``). There are also outstanding bugs
-    in libdvdnav with seeking backwards and forwards in a video
-    stream. Specify ``dvdread://...`` to fix such problems.
-
 .. note:: DVD subtitles
     
     DVDs use image-based subtitles. Image subtitles are implemented as
@@ -630,7 +622,8 @@ or at runtime with the ``apply-profile <name>`` command.
 
         # a profile that can be enabled with --profile=big-cache
         [big-cache]
-        cache=123400
+        cache=yes
+        demuxer-max-bytes=123400KiB
         demuxer-readahead-secs=20
 
         [slow]
@@ -735,12 +728,10 @@ listed.
   to the display as well, e.g.: ``Dropped: 4/34``. This happens only if
   decoder frame dropping is enabled with the ``--framedrop`` options.
   (``drop-frame-count`` property.)
-- Cache state, e.g. ``Cache:  2s+134KB``. Visible if the stream cache is enabled.
+- Cache state, e.g. ``Cache:  2s/134KB``. Visible if the stream cache is enabled.
   The first value shows the amount of video buffered in the demuxer in seconds,
-  the second value shows the sum of the demuxer forward cache size and the
-  *additional* data buffered in the stream cache in kilobytes.
-  (``demuxer-cache-duration``, ``demuxer-cache-state``, ``cache-used``
-  properties.)
+  the second value shows the estimated size of the buffered amount in kilobytes.
+  (``demuxer-cache-duration`` and ``demuxer-cache-state`` properties.)
 
 
 LOW LATENCY PLAYBACK

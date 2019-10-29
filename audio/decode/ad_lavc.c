@@ -37,6 +37,7 @@
 #include "demux/stheader.h"
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
+#include "options/m_config.h"
 #include "options/options.h"
 
 struct priv {
@@ -47,7 +48,7 @@ struct priv {
     bool preroll_done;
     double next_pts;
     AVRational codec_timebase;
-    bool eof_returned;
+    struct lavc_state state;
 
     struct mp_decoder public;
 };
@@ -80,8 +81,9 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
                  const char *decoder)
 {
     struct priv *ctx = da->priv;
-    struct MPOpts *mpopts = da->global->opts;
-    struct ad_lavc_params *opts = mpopts->ad_lavc_params;
+    struct MPOpts *mpopts = mp_get_config_group(ctx, da->global, GLOBAL_CONFIG);
+    struct ad_lavc_params *opts =
+        mp_get_config_group(ctx, da->global, &ad_lavc_conf);
     AVCodecContext *lavc_context;
     AVCodec *lavc_codec;
 
@@ -157,10 +159,10 @@ static void reset(struct mp_filter *da)
     ctx->trim_samples = 0;
     ctx->preroll_done = false;
     ctx->next_pts = MP_NOPTS_VALUE;
-    ctx->eof_returned = false;
+    ctx->state = (struct lavc_state){0};
 }
 
-static bool send_packet(struct mp_filter *da, struct demux_packet *mpkt)
+static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
 {
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
@@ -175,16 +177,12 @@ static bool send_packet(struct mp_filter *da, struct demux_packet *mpkt)
     mp_set_av_packet(&pkt, mpkt, &priv->codec_timebase);
 
     int ret = avcodec_send_packet(avctx, mpkt ? &pkt : NULL);
-
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-        return false;
-
     if (ret < 0)
         MP_ERR(da, "Error decoding audio.\n");
-    return true;
+    return ret;
 }
 
-static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
+static int receive_frame(struct mp_filter *da, struct mp_frame *out)
 {
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
@@ -196,7 +194,7 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
         // over in case we get new packets at some point in the future.
         // (Dont' reset the filter itself, we want to keep other state.)
         avcodec_flush_buffers(priv->avctx);
-        return false;
+        return ret;
     } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
         MP_ERR(da, "Error decoding audio.\n");
     }
@@ -207,13 +205,15 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
 #endif
 
     if (!priv->avframe->buf[0])
-        return true;
+        return ret;
 
     double out_pts = mp_pts_from_av(priv->avframe->pts, &priv->codec_timebase);
 
     struct mp_aframe *mpframe = mp_aframe_from_avframe(priv->avframe);
-    if (!mpframe)
-        return true;
+    if (!mpframe) {
+        MP_ERR(da, "Converting libavcodec frame to mpv frame failed.\n");
+        return ret;
+    }
 
     if (priv->force_channel_map.num)
         mp_aframe_set_chmap(mpframe, &priv->force_channel_map);
@@ -252,18 +252,22 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
         priv->trim_samples -= trim;
     }
 
-    *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
+    if (mp_aframe_get_size(mpframe) > 0) {
+        *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
+    } else {
+        talloc_free(mpframe);
+    }
 
     av_frame_unref(priv->avframe);
 
-    return true;
+    return ret;
 }
 
 static void process(struct mp_filter *ad)
 {
     struct priv *priv = ad->priv;
 
-    lavc_process(ad, &priv->eof_returned, send_packet, receive_frame);
+    lavc_process(ad, &priv->state, send_packet, receive_frame);
 }
 
 static const struct mp_filter_info ad_lavc_filter = {

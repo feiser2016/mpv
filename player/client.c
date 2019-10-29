@@ -31,12 +31,15 @@
 #include "input/cmd.h"
 #include "misc/ctype.h"
 #include "misc/dispatch.h"
+#include "misc/node.h"
 #include "misc/rendezvous.h"
+#include "misc/thread_tools.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
 #include "options/m_property.h"
 #include "options/path.h"
 #include "options/parse_configfile.h"
+#include "osdep/atomic.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "osdep/io.h"
@@ -63,11 +66,12 @@ struct mp_client_api {
 
     pthread_mutex_t lock;
 
+    atomic_bool uses_vo_libmpv;
+
     // -- protected by lock
 
     struct mpv_handle **clients;
     int num_clients;
-    uint64_t event_masks; // combined events of all clients, or 0 if unknown
     bool shutting_down; // do not allow new clients
     bool have_terminator; // a client took over the role of destroying the core
     bool terminate_core_thread; // make libmpv core thread exit
@@ -80,18 +84,23 @@ struct mp_client_api {
 };
 
 struct observe_property {
+    struct mpv_handle *owner;
     char *name;
     int id;                 // ==mp_get_property_id(name)
     uint64_t event_mask;    // ==mp_get_property_event_mask(name)
     int64_t reply_id;
     mpv_format format;
+    const struct m_option *type;
     bool changed;           // property change should be signaled to user
-    bool need_new_value;    // a new value should be retrieved
-    bool updating;          // a new value is being retrieved
     bool dead;              // property unobserved while retrieving value
-    bool new_value_valid, user_value_valid;
-    union m_option_value new_value, user_value;
-    struct mpv_handle *client;
+    bool value_valid;
+    union m_option_value value;
+    // Only if async. update is used.
+    uint64_t async_change_ts;   // logical timestamp incremented on each change
+    uint64_t async_value_ts;    // logical timestamp for async_value contents
+    bool async_updating;        // if true, updating async_value_ts to change_ts
+    bool async_value_valid;
+    union m_option_value async_value;
 };
 
 struct mpv_handle {
@@ -127,12 +136,12 @@ struct mpv_handle {
     int first_event;        // events[first_event] is the first readable event
     int num_events;         // number of readable events
     int reserved_events;    // number of entries reserved for replies
+    size_t async_counter;   // pending other async events
     bool choked;            // recovering from queue overflow
 
     struct observe_property **properties;
     int num_properties;
     int lowest_changed;     // attempt at making change processing incremental
-    int properties_updating;
     uint64_t property_event_masks; // or-ed together event masks of all properties
 
     bool fuzzy_initialized; // see scripting.c wait_loaded()
@@ -141,7 +150,7 @@ struct mpv_handle {
 };
 
 static bool gen_log_message_event(struct mpv_handle *ctx);
-static bool gen_property_change_event(struct mpv_handle *ctx);
+static bool gen_property_change_event(struct mpv_handle *ctx, bool *unlocked);
 static void notify_property_events(struct mpv_handle *ctx, uint64_t event_mask);
 
 void mp_clients_init(struct MPContext *mpctx)
@@ -188,13 +197,6 @@ bool mp_clients_all_initialized(struct MPContext *mpctx)
     }
     pthread_mutex_unlock(&mpctx->clients->lock);
     return all_ok;
-}
-
-static void invalidate_global_event_mask(struct mpv_handle *ctx)
-{
-    pthread_mutex_lock(&ctx->clients->lock);
-    ctx->clients->event_masks = 0;
-    pthread_mutex_unlock(&ctx->clients->lock);
 }
 
 static struct mpv_handle *find_client(struct mp_client_api *clients,
@@ -262,7 +264,6 @@ struct mpv_handle *mp_new_client(struct mp_client_api *clients, const char *name
     if (clients->num_clients == 1 && !clients->mpctx->is_cli)
         client->fuzzy_initialized = true;
 
-    clients->event_masks = 0;
     pthread_mutex_unlock(&clients->lock);
 
     mpv_request_event(client, MPV_EVENT_TICK, 0);
@@ -365,9 +366,33 @@ static void unlock_core(mpv_handle *ctx)
 void mpv_wait_async_requests(mpv_handle *ctx)
 {
     pthread_mutex_lock(&ctx->lock);
-    while (ctx->reserved_events || ctx->properties_updating)
+    while (ctx->reserved_events || ctx->async_counter)
         wait_wakeup(ctx, INT64_MAX);
     pthread_mutex_unlock(&ctx->lock);
+}
+
+// Send abort signal to all matching work items.
+// If type==0, destroy all of the matching ctx.
+// If ctx==0, destroy all.
+static void abort_async(struct MPContext *mpctx, mpv_handle *ctx,
+                        int type, uint64_t id)
+{
+    pthread_mutex_lock(&mpctx->abort_lock);
+
+    // Destroy all => ensure any newly appearing work is aborted immediately.
+    if (ctx == NULL)
+        mpctx->abort_all = true;
+
+    for (int n = 0; n < mpctx->num_abort_list; n++) {
+        struct mp_abort_entry *abort = mpctx->abort_list[n];
+        if (!ctx || (abort->client == ctx && (!type ||
+            (abort->client_work_type == type && abort->client_work_id == id))))
+        {
+            mp_abort_trigger_locked(mpctx, abort);
+        }
+    }
+
+    pthread_mutex_unlock(&mpctx->abort_lock);
 }
 
 static void get_thread(void *ptr)
@@ -387,6 +412,8 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
 
     if (terminate)
         mpv_command(ctx, (const char*[]){"quit", NULL});
+
+    abort_async(mpctx, ctx, 0, 0);
 
     // reserved_events equals the number of asynchronous requests that weren't
     // yet replied. In order to avoid that trying to reply to a removed client
@@ -483,32 +510,52 @@ void mpv_terminate_destroy(mpv_handle *ctx)
     mp_destroy_client(ctx, true);
 }
 
-static bool can_terminate(struct MPContext *mpctx)
-{
-    struct mp_client_api *clients = mpctx->clients;
-
-    pthread_mutex_lock(&clients->lock);
-    bool ok = clients->num_clients == 0 && mpctx->outstanding_async == 0 &&
-              (mpctx->is_cli || clients->terminate_core_thread);
-    pthread_mutex_unlock(&clients->lock);
-
-    return ok;
-}
-
 // Can be called on the core thread only. Idempotent.
+// Also happens to take care of shutting down any async work.
 void mp_shutdown_clients(struct MPContext *mpctx)
 {
     struct mp_client_api *clients = mpctx->clients;
 
-    // Prevent that new clients can appear.
-    pthread_mutex_lock(&clients->lock);
-    clients->shutting_down = true;
-    pthread_mutex_unlock(&clients->lock);
+    // Forcefully abort async work after 2 seconds of waiting.
+    double abort_time = mp_time_sec() + 2;
 
-    while (!can_terminate(mpctx)) {
+    pthread_mutex_lock(&clients->lock);
+
+    // Prevent that new clients can appear.
+    clients->shutting_down = true;
+
+    // Wait until we can terminate.
+    while (clients->num_clients || mpctx->outstanding_async ||
+           !(mpctx->is_cli || clients->terminate_core_thread))
+    {
+        pthread_mutex_unlock(&clients->lock);
+
+        double left = abort_time - mp_time_sec();
+        if (left >= 0) {
+            mp_set_timeout(mpctx, left);
+        } else {
+            // Forcefully abort any ongoing async work. This is quite rude and
+            // probably not what everyone wants, so it happens only after a
+            // timeout.
+            abort_async(mpctx, NULL, 0, 0);
+        }
+
         mp_client_broadcast_event(mpctx, MPV_EVENT_SHUTDOWN, NULL);
         mp_wait_events(mpctx);
+
+        pthread_mutex_lock(&clients->lock);
     }
+
+    pthread_mutex_unlock(&clients->lock);
+}
+
+bool mp_is_shutting_down(struct MPContext *mpctx)
+{
+    struct mp_client_api *clients = mpctx->clients;
+    pthread_mutex_lock(&clients->lock);
+    bool res = clients->shutting_down;
+    pthread_mutex_unlock(&clients->lock);
+    return res;
 }
 
 static void *core_thread(void *p)
@@ -677,39 +724,6 @@ static void send_reply(struct mpv_handle *ctx, uint64_t userdata,
     pthread_mutex_unlock(&ctx->lock);
 }
 
-static void status_reply(struct mpv_handle *ctx, int event,
-                         uint64_t userdata, int status)
-{
-    struct mpv_event reply = {
-        .event_id = event,
-        .error = status,
-    };
-    send_reply(ctx, userdata, &reply);
-}
-
-// Return whether there's any client listening to this event.
-// If false is returned, the core doesn't need to send it.
-bool mp_client_event_is_registered(struct MPContext *mpctx, int event)
-{
-    struct mp_client_api *clients = mpctx->clients;
-
-    pthread_mutex_lock(&clients->lock);
-
-    if (!clients->event_masks) { // lazy update
-        for (int n = 0; n < clients->num_clients; n++) {
-            struct mpv_handle *ctx = clients->clients[n];
-            pthread_mutex_lock(&ctx->lock);
-            clients->event_masks |= ctx->event_mask | ctx->property_event_masks;
-            pthread_mutex_unlock(&ctx->lock);
-        }
-    }
-    bool r = clients->event_masks & (1ULL << event);
-
-    pthread_mutex_unlock(&clients->lock);
-
-    return r;
-}
-
 void mp_client_broadcast_event(struct MPContext *mpctx, int event, void *data)
 {
     struct mp_client_api *clients = mpctx->clients;
@@ -789,7 +803,6 @@ int mpv_request_event(mpv_handle *ctx, mpv_event_id event, int enable)
     uint64_t bit = 1ULL << event;
     ctx->event_mask = enable ? ctx->event_mask | bit : ctx->event_mask & ~bit;
     pthread_mutex_unlock(&ctx->lock);
-    invalidate_global_event_mask(ctx);
     return 0;
 }
 
@@ -832,12 +845,15 @@ mpv_event *mpv_wait_event(mpv_handle *ctx, double timeout)
             talloc_steal(event, event->data);
             break;
         }
+        bool unlocked = false;
         // If there's a changed property, generate change event (never queued).
-        if (gen_property_change_event(ctx))
+        if (gen_property_change_event(ctx, &unlocked))
             break;
         // Pop item from message queue, and return as event.
         if (gen_log_message_event(ctx))
             break;
+        if (unlocked)
+            continue;
         int r = wait_wakeup(ctx, deadline);
         if (r == ETIMEDOUT)
             break;
@@ -905,54 +921,6 @@ static bool conv_node_to_format(void *dst, mpv_format dst_fmt, mpv_node *src)
     return false;
 }
 
-// Note: for MPV_FORMAT_NODE_MAP, this (incorrectly) takes the order into
-//       account, instead of treating it as set.
-static bool compare_value(void *a, void *b, mpv_format format)
-{
-    switch (format) {
-    case MPV_FORMAT_NONE:
-        return true;
-    case MPV_FORMAT_STRING:
-    case MPV_FORMAT_OSD_STRING:
-        return strcmp(*(char **)a, *(char **)b) == 0;
-    case MPV_FORMAT_FLAG:
-        return *(int *)a == *(int *)b;
-    case MPV_FORMAT_INT64:
-        return *(int64_t *)a == *(int64_t *)b;
-    case MPV_FORMAT_DOUBLE:
-        return *(double *)a == *(double *)b;
-    case MPV_FORMAT_NODE: {
-        struct mpv_node *a_n = a, *b_n = b;
-        if (a_n->format != b_n->format)
-            return false;
-        return compare_value(&a_n->u, &b_n->u, a_n->format);
-    }
-    case MPV_FORMAT_BYTE_ARRAY: {
-        struct mpv_byte_array *a_r = a, *b_r = b;
-        if (a_r->size != b_r->size)
-            return false;
-        return memcmp(a_r->data, b_r->data, a_r->size) == 0;
-    }
-    case MPV_FORMAT_NODE_ARRAY:
-    case MPV_FORMAT_NODE_MAP:
-    {
-        mpv_node_list *l_a = *(mpv_node_list **)a, *l_b = *(mpv_node_list **)b;
-        if (l_a->num != l_b->num)
-            return false;
-        for (int n = 0; n < l_a->num; n++) {
-            if (!compare_value(&l_a->values[n], &l_b->values[n], MPV_FORMAT_NODE))
-                return false;
-            if (format == MPV_FORMAT_NODE_MAP) {
-                if (strcmp(l_a->keys[n], l_b->keys[n]) != 0)
-                    return false;
-            }
-        }
-        return true;
-    }
-    }
-    abort();
-}
-
 void mpv_free_node_contents(mpv_node *node)
 {
     static const struct m_option type = { .type = CONF_TYPE_NODE };
@@ -1017,40 +985,40 @@ static int run_async(mpv_handle *ctx, void (*fn)(void *fn_data), void *fn_data)
         talloc_free(fn_data);
         return err;
     }
-    mp_dispatch_enqueue_autofree(ctx->mpctx->dispatch, fn, fn_data);
+    mp_dispatch_enqueue(ctx->mpctx->dispatch, fn, fn_data);
     return 0;
 }
 
 struct cmd_request {
     struct MPContext *mpctx;
     struct mp_cmd *cmd;
-    struct mpv_node *res;
     int status;
-    struct mpv_handle *reply_ctx;
-    uint64_t userdata;
+    struct mpv_node *res;
+    struct mp_waiter completion;
 };
 
-static void cmd_fn(void *data)
+static void cmd_complete(struct mp_cmd_ctx *cmd)
 {
-    struct cmd_request *req = data;
-    int r = run_command(req->mpctx, req->cmd, req->res);
-    req->status = r >= 0 ? 0 : MPV_ERROR_COMMAND;
-    talloc_free(req->cmd);
-    if (req->reply_ctx) {
-        status_reply(req->reply_ctx, MPV_EVENT_COMMAND_REPLY,
-                     req->userdata, req->status);
+    struct cmd_request *req = cmd->on_completion_priv;
+
+    req->status = cmd->success ? 0 : MPV_ERROR_COMMAND;
+    if (req->res) {
+        *req->res = cmd->result;
+        cmd->result = (mpv_node){0};
     }
+
+    // Unblock the waiting thread (especially for async commands).
+    mp_waiter_wakeup(&req->completion, 0);
 }
 
 static int run_client_command(mpv_handle *ctx, struct mp_cmd *cmd, mpv_node *res)
 {
-    if (!ctx->mpctx->initialized)
-        return MPV_ERROR_UNINITIALIZED;
     if (!cmd)
         return MPV_ERROR_INVALID_PARAMETER;
-
-    if (mp_input_is_abort_cmd(cmd))
-        mp_abort_playback_async(ctx->mpctx);
+    if (!ctx->mpctx->initialized) {
+        talloc_free(cmd);
+        return MPV_ERROR_UNINITIALIZED;
+    }
 
     cmd->sender = ctx->name;
 
@@ -1058,8 +1026,27 @@ static int run_client_command(mpv_handle *ctx, struct mp_cmd *cmd, mpv_node *res
         .mpctx = ctx->mpctx,
         .cmd = cmd,
         .res = res,
+        .completion = MP_WAITER_INITIALIZER,
     };
-    run_locked(ctx, cmd_fn, &req);
+
+    bool async = cmd->flags & MP_ASYNC_CMD;
+
+    lock_core(ctx);
+    if (async) {
+        run_command(ctx->mpctx, cmd, NULL, NULL, NULL);
+    } else {
+        struct mp_abort_entry *abort = NULL;
+        if (cmd->def->can_abort) {
+            abort = talloc_zero(NULL, struct mp_abort_entry);
+            abort->client = ctx;
+        }
+        run_command(ctx->mpctx, cmd, abort, cmd_complete, &req);
+    }
+    unlock_core(ctx);
+
+    if (!async)
+        mp_waiter_wait(&req.completion);
+
     return req.status;
 }
 
@@ -1077,39 +1064,102 @@ int mpv_command_node(mpv_handle *ctx, mpv_node *args, mpv_node *result)
     return r;
 }
 
+int mpv_command_ret(mpv_handle *ctx, const char **args, mpv_node *result)
+{
+    struct mpv_node rn = {.format = MPV_FORMAT_NONE};
+    int r = run_client_command(ctx, mp_input_parse_cmd_strv(ctx->log, args), &rn);
+    if (result && r >= 0)
+        *result = rn;
+    return r;
+}
+
 int mpv_command_string(mpv_handle *ctx, const char *args)
 {
     return run_client_command(ctx,
         mp_input_parse_cmd(ctx->mpctx->input, bstr0((char*)args), ctx->name), NULL);
 }
 
-static int run_cmd_async(mpv_handle *ctx, uint64_t ud, struct mp_cmd *cmd)
+struct async_cmd_request {
+    struct MPContext *mpctx;
+    struct mp_cmd *cmd;
+    struct mpv_handle *reply_ctx;
+    uint64_t userdata;
+};
+
+static void async_cmd_complete(struct mp_cmd_ctx *cmd)
 {
-    if (!ctx->mpctx->initialized)
-        return MPV_ERROR_UNINITIALIZED;
+    struct async_cmd_request *req = cmd->on_completion_priv;
+
+    struct mpv_event_command *data = talloc_zero(NULL, struct mpv_event_command);
+    data->result = cmd->result;
+    cmd->result = (mpv_node){0};
+    talloc_steal(data, node_get_alloc(&data->result));
+
+    struct mpv_event reply = {
+        .event_id = MPV_EVENT_COMMAND_REPLY,
+        .data = data,
+        .error = cmd->success ? 0 : MPV_ERROR_COMMAND,
+    };
+    send_reply(req->reply_ctx, req->userdata, &reply);
+
+    talloc_free(req);
+}
+
+static void async_cmd_fn(void *data)
+{
+    struct async_cmd_request *req = data;
+
+    struct mp_cmd *cmd = req->cmd;
+    ta_xset_parent(cmd, NULL);
+    req->cmd = NULL;
+
+    struct mp_abort_entry *abort = NULL;
+    if (cmd->def->can_abort) {
+        abort = talloc_zero(NULL, struct mp_abort_entry);
+        abort->client = req->reply_ctx;
+        abort->client_work_type = MPV_EVENT_COMMAND_REPLY;
+        abort->client_work_id = req->userdata;
+    }
+
+    // This will synchronously or asynchronously call cmd_complete (depending
+    // on the command).
+    run_command(req->mpctx, cmd, abort, async_cmd_complete, req);
+}
+
+static int run_async_cmd(mpv_handle *ctx, uint64_t ud, struct mp_cmd *cmd)
+{
     if (!cmd)
         return MPV_ERROR_INVALID_PARAMETER;
+    if (!ctx->mpctx->initialized) {
+        talloc_free(cmd);
+        return MPV_ERROR_UNINITIALIZED;
+    }
 
     cmd->sender = ctx->name;
 
-    struct cmd_request *req = talloc_ptrtype(NULL, req);
-    *req = (struct cmd_request){
+    struct async_cmd_request *req = talloc_ptrtype(NULL, req);
+    *req = (struct async_cmd_request){
         .mpctx = ctx->mpctx,
-        .cmd = cmd,
+        .cmd = talloc_steal(req, cmd),
         .reply_ctx = ctx,
         .userdata = ud,
     };
-    return run_async(ctx, cmd_fn, req);
+    return run_async(ctx, async_cmd_fn, req);
 }
 
 int mpv_command_async(mpv_handle *ctx, uint64_t ud, const char **args)
 {
-    return run_cmd_async(ctx, ud, mp_input_parse_cmd_strv(ctx->log, args));
+    return run_async_cmd(ctx, ud, mp_input_parse_cmd_strv(ctx->log, args));
 }
 
 int mpv_command_node_async(mpv_handle *ctx, uint64_t ud, mpv_node *args)
 {
-    return run_cmd_async(ctx, ud, mp_input_parse_cmd_node(ctx->log, args));
+    return run_async_cmd(ctx, ud, mp_input_parse_cmd_node(ctx->log, args));
+}
+
+void mpv_abort_async_command(mpv_handle *ctx, uint64_t reply_userdata)
+{
+    abort_async(ctx->mpctx, ctx, MPV_EVENT_COMMAND_REPLY, reply_userdata);
 }
 
 static int translate_property_error(int errc)
@@ -1156,8 +1206,12 @@ static void setproperty_fn(void *arg)
     req->status = translate_property_error(err);
 
     if (req->reply_ctx) {
-        status_reply(req->reply_ctx, MPV_EVENT_SET_PROPERTY_REPLY,
-                     req->userdata, req->status);
+        struct mpv_event reply = {
+            .event_id = MPV_EVENT_SET_PROPERTY_REPLY,
+            .error = req->status,
+        };
+        send_reply(req->reply_ctx, req->userdata, &reply);
+        talloc_free(req);
     }
 }
 
@@ -1313,6 +1367,7 @@ static void getproperty_fn(void *arg)
             .error = req->status,
         };
         send_reply(req->reply_ctx, req->userdata, &reply);
+        talloc_free(req);
     }
 }
 
@@ -1372,17 +1427,20 @@ int mpv_get_property_async(mpv_handle *ctx, uint64_t ud, const char *name,
 static void property_free(void *p)
 {
     struct observe_property *prop = p;
-    const struct m_option *type = get_mp_type_get(prop->format);
-    if (type) {
-        m_option_free(type, &prop->new_value);
-        m_option_free(type, &prop->user_value);
+
+    assert(!prop->async_updating);
+
+    if (prop->type) {
+        m_option_free(prop->type, &prop->value);
+        m_option_free(prop->type, &prop->async_value);
     }
 }
 
 int mpv_observe_property(mpv_handle *ctx, uint64_t userdata,
                          const char *name, mpv_format format)
 {
-    if (format != MPV_FORMAT_NONE && !get_mp_type_get(format))
+    const struct m_option *type = get_mp_type_get(format);
+    if (format != MPV_FORMAT_NONE && !type)
         return MPV_ERROR_PROPERTY_FORMAT;
     // Explicitly disallow this, because it would require a special code path.
     if (format == MPV_FORMAT_OSD_STRING)
@@ -1392,58 +1450,46 @@ int mpv_observe_property(mpv_handle *ctx, uint64_t userdata,
     struct observe_property *prop = talloc_ptrtype(ctx, prop);
     talloc_set_destructor(prop, property_free);
     *prop = (struct observe_property){
-        .client = ctx,
+        .owner = ctx,
         .name = talloc_strdup(prop, name),
         .id = mp_get_property_id(ctx->mpctx, name),
         .event_mask = mp_get_property_event_mask(name),
         .reply_id = userdata,
         .format = format,
+        .type = type,
         .changed = true,
-        .need_new_value = true,
     };
     MP_TARRAY_APPEND(ctx, ctx->properties, ctx->num_properties, prop);
     ctx->property_event_masks |= prop->event_mask;
     ctx->lowest_changed = 0;
     pthread_mutex_unlock(&ctx->lock);
-    invalidate_global_event_mask(ctx);
     return 0;
-}
-
-int mpv_unobserve_property(mpv_handle *ctx, uint64_t userdata)
-{
-    pthread_mutex_lock(&ctx->lock);
-    ctx->property_event_masks = 0;
-    int count = 0;
-    for (int n = ctx->num_properties - 1; n >= 0; n--) {
-        struct observe_property *prop = ctx->properties[n];
-        if (prop->reply_id == userdata) {
-            if (prop->updating) {
-                prop->dead = true;
-            } else {
-                // In case mpv_unobserve_property() is called after mpv_wait_event()
-                // returned, and the mpv_event still references the name somehow,
-                // make sure it's not freed while in use. The same can happen
-                // with the value update mechanism.
-                talloc_steal(ctx->cur_event, prop);
-            }
-            MP_TARRAY_REMOVE_AT(ctx->properties, ctx->num_properties, n);
-            count++;
-        }
-        if (!prop->dead)
-            ctx->property_event_masks |= prop->event_mask;
-    }
-    ctx->lowest_changed = 0;
-    pthread_mutex_unlock(&ctx->lock);
-    invalidate_global_event_mask(ctx);
-    return count;
 }
 
 static void mark_property_changed(struct mpv_handle *client, int index)
 {
     struct observe_property *prop = client->properties[index];
     prop->changed = true;
-    prop->need_new_value = prop->format != 0;
+    prop->async_change_ts += 1;
     client->lowest_changed = MPMIN(client->lowest_changed, index);
+}
+
+int mpv_unobserve_property(mpv_handle *ctx, uint64_t userdata)
+{
+    pthread_mutex_lock(&ctx->lock);
+    int count = 0;
+    for (int n = 0; n < ctx->num_properties; n++) {
+        struct observe_property *prop = ctx->properties[n];
+        // Perform actual removal of the property lazily to avoid creating
+        // dangling pointers and such.
+        if (prop->reply_id == userdata && !prop->dead) {
+            mark_property_changed(ctx, n);
+            prop->dead = true;
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return count;
 }
 
 // Broadcast that a property has changed.
@@ -1481,13 +1527,19 @@ static void notify_property_events(struct mpv_handle *ctx, uint64_t event_mask)
         wakeup_client(ctx);
 }
 
-static void update_prop(void *p)
+static void update_prop_async(void *p)
 {
     struct observe_property *prop = p;
-    struct mpv_handle *ctx = prop->client;
+    struct mpv_handle *ctx = prop->owner;
 
-    const struct m_option *type = get_mp_type_get(prop->format);
     union m_option_value val = {0};
+    bool val_valid = false;
+    uint64_t value_ts;
+
+    pthread_mutex_lock(&ctx->lock);
+    value_ts = prop->async_change_ts;
+    assert(prop->async_updating);
+    pthread_mutex_unlock(&ctx->lock);
 
     struct getproperty_request req = {
         .mpctx = ctx->mpctx,
@@ -1495,69 +1547,153 @@ static void update_prop(void *p)
         .format = prop->format,
         .data = &val,
     };
-
     getproperty_fn(&req);
+    val_valid = req.status >= 0;
 
     pthread_mutex_lock(&ctx->lock);
-    ctx->properties_updating--;
-    prop->updating = false;
-    m_option_free(type, &prop->new_value);
-    prop->new_value_valid = req.status >= 0;
-    if (prop->new_value_valid)
-        memcpy(&prop->new_value, &val, type->type->size);
-    if (prop->user_value_valid != prop->new_value_valid) {
-        prop->changed = true;
-    } else if (prop->user_value_valid && prop->new_value_valid) {
-        if (!compare_value(&prop->user_value, &prop->new_value, prop->format))
-            prop->changed = true;
-    }
-    if (prop->dead)
-        talloc_steal(ctx->cur_event, prop);
+
+    assert(prop->async_updating);
+
+    // Move to prop->async_value
+    m_option_free(prop->type, &prop->async_value);
+    memcpy(&prop->async_value, &val, prop->type->type->size);
+    prop->async_value_valid = val_valid;
+
+    prop->async_value_ts = value_ts;
+    prop->async_updating = false;
+
+    // Cause it to re-check the property.
+    prop->changed = true;
+    ctx->lowest_changed = 0;
+
+    ctx->async_counter -= 1;
     wakeup_client(ctx);
+
     pthread_mutex_unlock(&ctx->lock);
+}
+
+static bool update_prop(struct mpv_handle *ctx, struct observe_property *prop)
+{
+    if (!prop->type)
+        return true;
+
+    union m_option_value val = {0};
+    bool val_valid = false;
+
+    // With vo_libmpv, we can't lock the core for stupid reasons.
+    // Yes, that's FUCKING HORRIBLE. On the other hand, might be useful for
+    // true async. properties in the future.
+    if (atomic_load_explicit(&ctx->clients->uses_vo_libmpv, memory_order_relaxed)) {
+        if (prop->async_change_ts > prop->async_value_ts) {
+            if (!prop->async_updating) {
+                prop->async_updating = true;
+                ctx->async_counter += 1;
+                mp_dispatch_enqueue(ctx->mpctx->dispatch, update_prop_async, prop);
+            }
+            return false; // re-update later when the changed value comes in
+        }
+
+        m_option_copy(prop->type, &val, &prop->async_value);
+        val_valid = prop->async_value_valid;
+    } else {
+        pthread_mutex_unlock(&ctx->lock);
+
+        struct getproperty_request req = {
+            .mpctx = ctx->mpctx,
+            .name = prop->name,
+            .format = prop->format,
+            .data = &val,
+        };
+        run_locked(ctx, getproperty_fn, &req);
+        val_valid = req.status >= 0;
+
+        pthread_mutex_lock(&ctx->lock);
+    }
+
+    bool changed = prop->value_valid != val_valid;
+    if (prop->value_valid && val_valid)
+        changed = !equal_mpv_value(&prop->value, &val, prop->format);
+
+    if (changed) {
+        prop->value_valid = val_valid;
+        if (val_valid) {
+            // move val to prop->value
+            m_option_free(prop->type, &prop->value);
+            memcpy(&prop->value, &val, prop->type->type->size);
+            val_valid = false;
+        }
+    }
+
+    if (val_valid)
+        m_option_free(prop->type, &val);
+
+    return changed;
 }
 
 // Set ctx->cur_event to a generated property change event, if there is any
 // outstanding property.
-static bool gen_property_change_event(struct mpv_handle *ctx)
+static bool gen_property_change_event(struct mpv_handle *ctx, bool *unlocked)
 {
     if (!ctx->mpctx->initialized)
         return false;
+
+    *ctx->cur_event = (struct mpv_event){
+        .event_id = MPV_EVENT_NONE,
+    };
+
+    bool need_gc = false;
     int start = ctx->lowest_changed;
     ctx->lowest_changed = ctx->num_properties;
     for (int n = start; n < ctx->num_properties; n++) {
         struct observe_property *prop = ctx->properties[n];
-        if ((prop->changed || prop->updating) && n < ctx->lowest_changed)
+        if (prop->changed && n < ctx->lowest_changed)
             ctx->lowest_changed = n;
-        if (prop->changed) {
-            bool get_value = prop->need_new_value;
-            prop->need_new_value = false;
+
+        bool updated = false;
+        if (prop->changed && !prop->dead) {
             prop->changed = false;
-            if (prop->format && get_value) {
-                ctx->properties_updating++;
-                prop->updating = true;
-                mp_dispatch_enqueue(ctx->mpctx->dispatch, update_prop, prop);
+            updated = update_prop(ctx, prop);
+            *unlocked = true; // not always; but good enough
+        }
+
+        if (prop->dead) {
+            need_gc = true;
+        } else if (updated) {
+            ctx->cur_property_event = (struct mpv_event_property){
+                .name = prop->name,
+                .format = prop->value_valid ? prop->format : 0,
+                .data = prop->value_valid ? &prop->value : NULL,
+            };
+            *ctx->cur_event = (struct mpv_event){
+                .event_id = MPV_EVENT_PROPERTY_CHANGE,
+                .reply_userdata = prop->reply_id,
+                .data = &ctx->cur_property_event,
+            };
+            break;
+        }
+    }
+
+    if (need_gc) {
+        // Remove entries which have the .dead flag set. The point of doing this
+        // here is to ensure that this does not conflict with update_prop(),
+        // and that a previously returned mpv_event struct pointing to removed
+        // property entries does not result in dangling pointers.
+        ctx->property_event_masks = 0;
+        ctx->lowest_changed = 0;
+        for (int n = ctx->num_properties - 1; n >= 0; n--) {
+            struct observe_property *prop = ctx->properties[n];
+            if (prop->dead) {
+                if (!prop->async_updating) {
+                    MP_TARRAY_REMOVE_AT(ctx->properties, ctx->num_properties, n);
+                    talloc_free(prop);
+                }
             } else {
-                const struct m_option *type = get_mp_type_get(prop->format);
-                prop->user_value_valid = prop->new_value_valid;
-                if (prop->new_value_valid)
-                    m_option_copy(type, &prop->user_value, &prop->new_value);
-                ctx->cur_property_event = (struct mpv_event_property){
-                    .name = prop->name,
-                    .format = prop->user_value_valid ? prop->format : 0,
-                };
-                if (prop->user_value_valid)
-                    ctx->cur_property_event.data = &prop->user_value;
-                *ctx->cur_event = (struct mpv_event){
-                    .event_id = MPV_EVENT_PROPERTY_CHANGE,
-                    .reply_userdata = prop->reply_id,
-                    .data = &ctx->cur_property_event,
-                };
-                return true;
+                ctx->property_event_masks |= prop->event_mask;
             }
         }
     }
-    return false;
+
+    return !!ctx->cur_event->event_id;
 }
 
 int mpv_hook_add(mpv_handle *ctx, uint64_t reply_userdata,
@@ -1749,16 +1885,9 @@ int64_t mpv_get_time_us(mpv_handle *ctx)
 
 #include "video/out/libmpv.h"
 
-struct kill_ctx {
-    struct MPContext *mpctx;
-    void (*fin)(void *ctx);
-    void *fin_ctx;
-};
-
 static void do_kill(void *ptr)
 {
-    struct kill_ctx *k = ptr;
-    struct MPContext *mpctx = k->mpctx;
+    struct MPContext *mpctx = ptr;
 
     struct track *track = mpctx->vo_chain ? mpctx->vo_chain->track : NULL;
     uninit_video_out(mpctx);
@@ -1766,22 +1895,13 @@ static void do_kill(void *ptr)
         mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
         error_on_track(mpctx, track);
     }
-
-    k->fin(k->fin_ctx);
 }
 
 // Used by vo_libmpv to (a)synchronously uninitialize video.
-void kill_video_async(struct mp_client_api *client_api, void (*fin)(void *ctx),
-                      void *fin_ctx)
+void kill_video_async(struct mp_client_api *client_api)
 {
     struct MPContext *mpctx = client_api->mpctx;
-    struct kill_ctx *k = talloc_ptrtype(NULL, k);
-    *k = (struct kill_ctx){
-        .mpctx = mpctx,
-        .fin = fin,
-        .fin_ctx = fin_ctx,
-    };
-    mp_dispatch_enqueue_autofree(mpctx->dispatch, do_kill, k);
+    mp_dispatch_enqueue(mpctx->dispatch, do_kill, mpctx);
 }
 
 // Used by vo_libmpv to set the current render context.
@@ -1798,6 +1918,7 @@ bool mp_set_main_render_context(struct mp_client_api *client_api,
     if (res)
         client_api->render_context = active ? ctx : NULL;
     pthread_mutex_unlock(&client_api->lock);
+    atomic_store(&client_api->uses_vo_libmpv, active);
     return res;
 }
 

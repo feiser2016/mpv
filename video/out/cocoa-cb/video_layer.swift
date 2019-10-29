@@ -19,20 +19,63 @@ import Cocoa
 import OpenGL.GL
 import OpenGL.GL3
 
+let glVersions: [CGLOpenGLProfile] = [
+    kCGLOGLPVersion_3_2_Core,
+    kCGLOGLPVersion_Legacy
+]
+
+let glFormatBase: [CGLPixelFormatAttribute] = [
+    kCGLPFAOpenGLProfile,
+    kCGLPFAAccelerated,
+    kCGLPFADoubleBuffer
+]
+
+let glFormatSoftwareBase: [CGLPixelFormatAttribute] = [
+    kCGLPFAOpenGLProfile,
+    kCGLPFARendererID,
+    CGLPixelFormatAttribute(UInt32(kCGLRendererGenericFloatID)),
+    kCGLPFADoubleBuffer
+]
+
+let glFormatOptional: [[CGLPixelFormatAttribute]] = [
+    [kCGLPFABackingStore],
+    [kCGLPFAAllowOfflineRenderers],
+    [kCGLPFASupportsAutomaticGraphicsSwitching]
+]
+
+let glFormat10Bit: [CGLPixelFormatAttribute] = [
+    kCGLPFAColorSize,
+    _CGLPixelFormatAttribute(rawValue: 64),
+    kCGLPFAColorFloat
+]
+
+let attributeLookUp: [UInt32:String] = [
+    kCGLOGLPVersion_3_2_Core.rawValue:     "kCGLOGLPVersion_3_2_Core",
+    kCGLOGLPVersion_Legacy.rawValue:       "kCGLOGLPVersion_Legacy",
+    kCGLPFAOpenGLProfile.rawValue:         "kCGLPFAOpenGLProfile",
+    UInt32(kCGLRendererGenericFloatID):    "kCGLRendererGenericFloatID",
+    kCGLPFARendererID.rawValue:            "kCGLPFARendererID",
+    kCGLPFAAccelerated.rawValue:           "kCGLPFAAccelerated",
+    kCGLPFADoubleBuffer.rawValue:          "kCGLPFADoubleBuffer",
+    kCGLPFABackingStore.rawValue:          "kCGLPFABackingStore",
+    kCGLPFAColorSize.rawValue:             "kCGLPFAColorSize",
+    kCGLPFAColorFloat.rawValue:            "kCGLPFAColorFloat",
+    kCGLPFAAllowOfflineRenderers.rawValue: "kCGLPFAAllowOfflineRenderers",
+    kCGLPFASupportsAutomaticGraphicsSwitching.rawValue: "kCGLPFASupportsAutomaticGraphicsSwitching",
+]
+
 class VideoLayer: CAOpenGLLayer {
 
-    weak var cocoaCB: CocoaCB!
-    var mpv: MPVHelper! {
-        get { return cocoaCB == nil ? nil : cocoaCB.mpv }
-    }
+    unowned var cocoaCB: CocoaCB
+    var libmpv: LibmpvHelper { get { return cocoaCB.libmpv } }
 
-    let videoLock = NSLock()
     let displayLock = NSLock()
+    let cglContext: CGLContextObj
+    let cglPixelFormat: CGLPixelFormatObj
     var needsFlip: Bool = false
     var forceDraw: Bool = false
-    var cglContext: CGLContextObj? = nil
-    var cglPixelFormat: CGLPixelFormatObj? = nil
-    var surfaceSize: NSSize?
+    var surfaceSize: NSSize = NSSize(width: 0, height: 0)
+    var bufferDepth: GLint = 8
 
     enum Draw: Int { case normal = 1, atomic, atomicEnd }
     var draw: Draw = .normal
@@ -58,24 +101,34 @@ class VideoLayer: CAOpenGLLayer {
 
     init(cocoaCB ccb: CocoaCB) {
         cocoaCB = ccb
+        (cglPixelFormat, bufferDepth) = VideoLayer.createPixelFormat(ccb.libmpv)
+        cglContext = VideoLayer.createContext(ccb.libmpv, cglPixelFormat)
         super.init()
         autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         backgroundColor = NSColor.black.cgColor
 
-        cglPixelFormat = copyCGLPixelFormat(forDisplayMask: 0)
-        CGLCreateContext(cglPixelFormat!, nil, &cglContext)
-        var i: GLint = 1
-        CGLSetParameter(cglContext!, kCGLCPSwapInterval, &i)
-        CGLSetCurrentContext(cglContext!)
+        if #available(macOS 10.12, *), bufferDepth > 8 {
+            contentsFormat = .RGBA16Float
+        }
 
-        mpv.initRender()
-        mpv.setRenderUpdateCallback(updateCallback, context: self)
-        mpv.setRenderControlCallback(cocoaCB.controlCallback, context: cocoaCB)
+        var i: GLint = 1
+        CGLSetParameter(cglContext, kCGLCPSwapInterval, &i)
+        CGLSetCurrentContext(cglContext)
+
+        libmpv.initRender()
+        libmpv.setRenderUpdateCallback(updateCallback, context: self)
+        libmpv.setRenderControlCallback(cocoaCB.controlCallback, context: cocoaCB)
     }
 
+    //necessary for when the layer containing window changes the screen
     override init(layer: Any) {
-        let oldLayer = layer as! VideoLayer
+        guard let oldLayer = layer as? VideoLayer else {
+            fatalError("init(layer: Any) passed an invalid layer")
+        }
         cocoaCB = oldLayer.cocoaCB
+        surfaceSize = oldLayer.surfaceSize
+        cglPixelFormat = oldLayer.cglPixelFormat
+        cglContext = oldLayer.cglContext
         super.init()
     }
 
@@ -90,8 +143,8 @@ class VideoLayer: CAOpenGLLayer {
         if inLiveResize == false {
             isAsynchronous = false
         }
-        return mpv != nil && cocoaCB.backendState == .initialized &&
-               (forceDraw || mpv.isRenderUpdateFrame())
+        return cocoaCB.backendState == .initialized &&
+               (forceDraw || libmpv.isRenderUpdateFrame())
     }
 
     override func draw(inCGLContext ctx: CGLContextObj,
@@ -110,8 +163,7 @@ class VideoLayer: CAOpenGLLayer {
         }
 
         updateSurfaceSize()
-        mpv.drawRender(surfaceSize!)
-        CGLFlushDrawable(ctx)
+        libmpv.drawRender(surfaceSize, bufferDepth, ctx)
 
         if needsICCUpdate {
             needsICCUpdate = false
@@ -122,12 +174,12 @@ class VideoLayer: CAOpenGLLayer {
     func updateSurfaceSize() {
         var dims: [GLint] = [0, 0, 0, 0]
         glGetIntegerv(GLenum(GL_VIEWPORT), &dims)
-        surfaceSize = NSMakeSize(CGFloat(dims[2]), CGFloat(dims[3]))
+        surfaceSize = NSSize(width: CGFloat(dims[2]), height: CGFloat(dims[3]))
 
-        if NSEqualSizes(surfaceSize!, NSZeroSize) {
+        if NSEqualSizes(surfaceSize, NSZeroSize) {
             surfaceSize = bounds.size
-            surfaceSize!.width *= contentsScale
-            surfaceSize!.height *= contentsScale
+            surfaceSize.width *= contentsScale
+            surfaceSize.height *= contentsScale
         }
     }
 
@@ -146,93 +198,16 @@ class VideoLayer: CAOpenGLLayer {
     }
 
     override func copyCGLPixelFormat(forDisplayMask mask: UInt32) -> CGLPixelFormatObj {
-        if cglPixelFormat != nil { return cglPixelFormat! }
-
-        let attributeLookUp: [UInt32:String] = [
-            kCGLOGLPVersion_3_2_Core.rawValue:     "kCGLOGLPVersion_3_2_Core",
-            kCGLOGLPVersion_Legacy.rawValue:       "kCGLOGLPVersion_Legacy",
-            kCGLPFAOpenGLProfile.rawValue:         "kCGLPFAOpenGLProfile",
-            kCGLPFAAccelerated.rawValue:           "kCGLPFAAccelerated",
-            kCGLPFADoubleBuffer.rawValue:          "kCGLPFADoubleBuffer",
-            kCGLPFABackingStore.rawValue:          "kCGLPFABackingStore",
-            kCGLPFAAllowOfflineRenderers.rawValue: "kCGLPFAAllowOfflineRenderers",
-            kCGLPFASupportsAutomaticGraphicsSwitching.rawValue: "kCGLPFASupportsAutomaticGraphicsSwitching",
-            0: ""
-        ]
-
-        let glVersions: [CGLOpenGLProfile] = [
-            kCGLOGLPVersion_3_2_Core,
-            kCGLOGLPVersion_Legacy
-        ]
-
-        var pix: CGLPixelFormatObj?
-        var err: CGLError = CGLError(rawValue: 0)
-        var npix: GLint = 0
-
-        verLoop : for ver in glVersions {
-            if mpv.macOpts!.cocoa_cb_sw_renderer == 1 { break }
-
-            var glAttributes: [CGLPixelFormatAttribute] = [
-                kCGLPFAOpenGLProfile, CGLPixelFormatAttribute(ver.rawValue),
-                kCGLPFAAccelerated,
-                kCGLPFADoubleBuffer,
-                kCGLPFABackingStore,
-                kCGLPFAAllowOfflineRenderers,
-                kCGLPFASupportsAutomaticGraphicsSwitching,
-                _CGLPixelFormatAttribute(rawValue: 0)
-            ]
-
-            for index in stride(from: glAttributes.count-2, through: 4, by: -1) {
-                err = CGLChoosePixelFormat(glAttributes, &pix, &npix)
-                if err == kCGLBadAttribute || err == kCGLBadPixelFormat || pix == nil {
-                    glAttributes.remove(at: index)
-                } else {
-                    var attArray = glAttributes.map({ (value: _CGLPixelFormatAttribute) -> String in
-                        return attributeLookUp[value.rawValue]!
-                    })
-                    attArray.removeLast()
-
-                    mpv.sendVerbose("Created CGL pixel format with attributes: " +
-                                    "\(attArray.joined(separator: ", "))")
-                    break verLoop
-                }
-            }
-        }
-
-        if (err != kCGLNoError || pix == nil) && mpv.macOpts!.cocoa_cb_sw_renderer != 0 {
-            if mpv.macOpts!.cocoa_cb_sw_renderer == -1 {
-                let errS = String(cString: CGLErrorString(err))
-                mpv.sendWarning("Couldn't create hardware accelerated CGL " +
-                                "pixel format, falling back to software " +
-                                "renderer: \(errS) (\(err.rawValue))")
-            }
-
-            let glAttributes: [CGLPixelFormatAttribute] = [
-                kCGLPFAOpenGLProfile, CGLPixelFormatAttribute(kCGLOGLPVersion_3_2_Core.rawValue),
-                kCGLPFARendererID, CGLPixelFormatAttribute(UInt32(kCGLRendererGenericFloatID)),
-                kCGLPFADoubleBuffer,
-                kCGLPFABackingStore,
-                _CGLPixelFormatAttribute(rawValue: 0)
-            ]
-
-            err = CGLChoosePixelFormat(glAttributes, &pix, &npix)
-        }
-
-        if err != kCGLNoError || pix == nil {
-            let errS = String(cString: CGLErrorString(err))
-            mpv.sendError("Couldn't create any CGL pixel format: \(errS) (\(err.rawValue))")
-            exit(1)
-        }
-        return pix!
+        return cglPixelFormat
     }
 
     override func copyCGLContext(forPixelFormat pf: CGLPixelFormatObj) -> CGLContextObj {
-        contentsScale = cocoaCB.window.backingScaleFactor
-        return cglContext!
+        contentsScale = cocoaCB.window?.backingScaleFactor ?? 1.0
+        return cglContext
     }
 
     let updateCallback: mpv_render_update_fn = { (ctx) in
-        let layer: VideoLayer = MPVHelper.bridge(ptr: ctx!)
+        let layer: VideoLayer = unsafeBitCast(ctx, to: VideoLayer.self)
         layer.update()
     }
 
@@ -242,9 +217,9 @@ class VideoLayer: CAOpenGLLayer {
         super.display()
         CATransaction.flush()
         if isUpdate && needsFlip {
-            CGLSetCurrentContext(cglContext!)
-            if mpv.isRenderUpdateFrame() {
-                mpv.drawRender(NSZeroSize, skip: true)
+            CGLSetCurrentContext(cglContext)
+            if libmpv.isRenderUpdateFrame() {
+                libmpv.drawRender(NSZeroSize, bufferDepth, cglContext, skip: true)
             }
         }
         displayLock.unlock()
@@ -260,4 +235,82 @@ class VideoLayer: CAOpenGLLayer {
         }
     }
 
+    class func createPixelFormat(_ libmpv: LibmpvHelper) -> (CGLPixelFormatObj, GLint) {
+        var pix: CGLPixelFormatObj?
+        var depth: GLint = 8
+        var err: CGLError = CGLError(rawValue: 0)
+        let swRender = libmpv.macOpts.cocoa_cb_sw_renderer
+
+        if swRender != 1 {
+            (pix, depth, err) = VideoLayer.findPixelFormat(libmpv)
+        }
+
+        if (err != kCGLNoError || pix == nil) && swRender != 0 {
+            (pix, depth, err) = VideoLayer.findPixelFormat(libmpv, software: true)
+        }
+
+        guard let pixelFormat = pix, err == kCGLNoError else {
+            libmpv.sendError("Couldn't create any CGL pixel format")
+            exit(1)
+        }
+
+        return (pixelFormat, depth)
+    }
+
+    class func findPixelFormat(_ libmpv: LibmpvHelper, software: Bool = false) -> (CGLPixelFormatObj?, GLint, CGLError) {
+        var pix: CGLPixelFormatObj?
+        var err: CGLError = CGLError(rawValue: 0)
+        var npix: GLint = 0
+
+        for ver in glVersions {
+            var glBase = software ? glFormatSoftwareBase : glFormatBase
+            glBase.insert(CGLPixelFormatAttribute(ver.rawValue), at: 1)
+
+            var glFormat = [glBase]
+            if (libmpv.macOpts.cocoa_cb_10bit_context == 1) {
+                glFormat += [glFormat10Bit]
+            }
+            glFormat += glFormatOptional
+
+            for index in stride(from: glFormat.count-1, through: 0, by: -1) {
+                let format = glFormat.flatMap { $0 } + [_CGLPixelFormatAttribute(rawValue: 0)]
+                err = CGLChoosePixelFormat(format, &pix, &npix)
+
+                if err == kCGLBadAttribute || err == kCGLBadPixelFormat || pix == nil {
+                    glFormat.remove(at: index)
+                } else {
+                    let attArray = format.map({ (value: _CGLPixelFormatAttribute) -> String in
+                        return attributeLookUp[value.rawValue] ?? String(value.rawValue)
+                    })
+
+                    libmpv.sendVerbose("Created CGL pixel format with attributes: " +
+                                    "\(attArray.joined(separator: ", "))")
+                    return (pix, glFormat.contains(glFormat10Bit) ? 16 : 8, err)
+                }
+            }
+        }
+
+        let errS = String(cString: CGLErrorString(err))
+        libmpv.sendWarning("Couldn't create a " +
+                           "\(software ? "software" : "hardware accelerated") " +
+                           "CGL pixel format: \(errS) (\(err.rawValue))")
+        if software == false && libmpv.macOpts.cocoa_cb_sw_renderer == -1 {
+            libmpv.sendWarning("Falling back to software renderer")
+        }
+
+        return (pix, 8, err)
+    }
+
+    class func createContext(_ libmpv: LibmpvHelper, _ pixelFormat: CGLPixelFormatObj) -> CGLContextObj {
+        var context: CGLContextObj?
+        let error = CGLCreateContext(pixelFormat, nil, &context)
+
+        guard let cglContext = context, error == kCGLNoError else {
+            let errS = String(cString: CGLErrorString(error))
+            libmpv.sendError("Couldn't create a CGLContext: " + errS)
+            exit(1)
+        }
+
+        return cglContext
+    }
 }

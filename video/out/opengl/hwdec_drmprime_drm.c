@@ -23,6 +23,7 @@
 #include <math.h>
 #include <stdbool.h>
 
+#include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
 
 #include "common.h"
@@ -44,6 +45,7 @@ struct drm_frame {
 
 struct priv {
     struct mp_log *log;
+    struct mp_hwdec_ctx hwctx;
 
     struct mp_image_params params;
 
@@ -146,8 +148,8 @@ static int overlay_frame(struct ra_hwdec *hw, struct mp_image *hw_image,
 
     // grab atomic request from native resources
     if (p->ctx) {
-        struct mpv_opengl_drm_params *drm_params;
-        drm_params = (mpv_opengl_drm_params *)ra_get_native_resource(hw->ra, "drm_params");
+        struct mpv_opengl_drm_params_v2 *drm_params;
+        drm_params = (mpv_opengl_drm_params_v2 *)ra_get_native_resource(hw->ra, "drm_params_v2");
         if (!drm_params) {
             MP_ERR(hw, "Failed to retrieve drm params from native resources\n");
             return -1;
@@ -231,6 +233,9 @@ static void uninit(struct ra_hwdec *hw)
     disable_video_plane(hw);
     set_current_frame(hw, NULL);
 
+    hwdec_devices_remove(hw->devs, &p->hwctx);
+    av_buffer_unref(&p->hwctx.av_device_ref);
+
     if (p->ctx) {
         drm_atomic_destroy_context(p->ctx);
         p->ctx = NULL;
@@ -250,9 +255,9 @@ static int init(struct ra_hwdec *hw)
     drmprime_video_plane = opts->drm_drmprime_video_plane;
     talloc_free(tmp);
 
-    struct mpv_opengl_drm_params *drm_params;
+    struct mpv_opengl_drm_params_v2 *drm_params;
 
-    drm_params = ra_get_native_resource(hw->ra, "drm_params");
+    drm_params = ra_get_native_resource(hw->ra, "drm_params_v2");
     if (drm_params) {
         p->ctx = drm_atomic_create_context(p->log, drm_params->fd, drm_params->crtc_id,
                                            drm_params->connector_id, draw_plane, drmprime_video_plane);
@@ -284,6 +289,15 @@ static int init(struct ra_hwdec *hw)
     }
 
     disable_video_plane(hw);
+
+    p->hwctx = (struct mp_hwdec_ctx) {
+        .driver_name = hw->driver->name,
+    };
+    if (!av_hwdevice_ctx_create(&p->hwctx.av_device_ref, AV_HWDEVICE_TYPE_DRM,
+                                drmGetDeviceNameFromFd2(p->ctx->fd), NULL, 0)) {
+        hwdec_devices_add(hw->devs, &p->hwctx);
+    }
+
     return 0;
 
 err:

@@ -150,6 +150,9 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             .linear_filter  = gl_fmt->flags & F_TF,
             .renderable     = (gl_fmt->flags & F_CR) &&
                               (gl->mpgl_caps & MPGL_CAP_FB),
+            // TODO: Check whether it's a storable format
+            // https://www.khronos.org/opengl/wiki/Image_Load_Store
+            .storable       = true,
         };
 
         int csize = gl_component_size(gl_fmt->type) * 8;
@@ -693,7 +696,7 @@ static void gl_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 }
 
-static int gl_desc_namespace(enum ra_vartype type)
+static int gl_desc_namespace(struct ra *ra, enum ra_vartype type)
 {
     return type;
 }

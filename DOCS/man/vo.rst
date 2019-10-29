@@ -308,7 +308,7 @@ Available video output drivers are:
     For tuning, refer to your copy of the file ``SDL_hints.h``.
 
     .. note:: This driver is for compatibility with systems that don't provide
-              proper graphics drivers, or which support GLES only.
+              proper graphics drivers.
 
     The following global options are supported by this video output:
 
@@ -415,6 +415,8 @@ Available video output drivers are:
             JPEG files, extension .jpeg.
         png
             PNG files.
+        webp
+            WebP files.
 
     ``--vo-image-png-compression=<0-9>``
         PNG compression factor (speed vs. file size tradeoff) (default: 7)
@@ -425,6 +427,12 @@ Available video output drivers are:
         JPEG quality factor (default: 90)
     ``--vo-image-jpeg-optimize=<0-100>``
         JPEG optimization factor (default: 100)
+    ``--vo-image-webp-lossless=<yes|no>``
+        Enable writing lossless WebP files (default: no)
+    ``--vo-image-webp-quality=<0-100>``
+        WebP quality (default: 75)
+    ``--vo-image-webp-compression=<0-6>``
+        WebP compression factor (default: 4)
     ``--vo-image-outdir=<dirname>``
         Specify the directory to save the image files to (default: ``./``).
 
@@ -479,14 +487,36 @@ Available video output drivers are:
     ``--drm-connector=[<gpu_number>.]<name>``
         Select the connector to use (usually this is a monitor.) If ``<name>``
         is empty or ``auto``, mpv renders the output on the first available
-        connector. Use ``--drm-connector=help`` to get list of available
+        connector. Use ``--drm-connector=help`` to get a list of available
         connectors. When using multiple graphic cards, use the ``<gpu_number>``
         argument to disambiguate.
         (default: empty)
 
-    ``--drm-mode=<number>``
-        Mode ID to use (resolution and frame rate).
-        (default: 0)
+    ``--drm-mode=<preferred|highest|N|WxH[@R]>``
+        Mode to use (resolution and frame rate).
+        Possible values:
+
+        :preferred: Use the preferred mode for the screen on the selected
+                    connector. (default)
+        :highest:   Use the mode with the highest resolution available on the
+                    selected connector.
+        :N:         Select mode by index.
+        :WxH[@R]:   Specify mode by width, height, and optionally refresh rate.
+                    In case several modes match, selects the mode that comes
+                    first in the EDID list of modes.
+
+        Use ``--drm-mode=help`` to get a list of available modes for all active
+        connectors.
+
+    ``--drm-atomic=<no|auto>``
+        Toggle use of atomic modesetting. Mostly useful for debugging.
+
+        :no:    Use legacy modesetting.
+        :auto:  Use atomic modesetting, falling back to legacy modesetting if
+                not available. (default)
+
+        Note: Only affects ``gpu-context=drm``. ``vo=drm`` supports legacy
+        modesetting only.
 
     ``--drm-draw-plane=<primary|overlay|N>``
         Select the DRM plane to which video and OSD is drawn to, under normal
@@ -518,11 +548,10 @@ Available video output drivers are:
         xrgb2101010 is a packed 30 bits per pixel/10 bits per channel packed RGB
         format with 2 bits of padding.
 
-        Unless you have an intel graphics card, a recent kernel and a recent
-        version of mesa (>=18) xrgb2101010 is unlikely to work for you.
-
-        This currently only has an effect when used together with the ``drm``
-        backend for the ``gpu`` VO. The ``drm`` VO always uses xrgb8888.
+        There are cases when xrgb2101010 will work with the ``drm`` VO, but not
+        with the ``drm`` backend for the ``gpu`` VO. This is because with the
+        ``gpu`` VO, in addition to requiring support in your DRM driver,
+        requires support for xrgb2101010 in your EGL driver
 
     ``--drm-draw-surface-size=<[WxH]>``
         Sets the size of the surface used on the draw plane. The surface will
@@ -547,5 +576,11 @@ Available video output drivers are:
     many of mpv's features (subtitle rendering, OSD/OSC, video filters, etc)
     are not available with this driver.
 
-    To use hardware decoding with ``--vo-gpu`` instead, use
+    To use hardware decoding with ``--vo=gpu`` instead, use
     ``--hwdec=mediacodec-copy`` along with ``--gpu-context=android``.
+
+``wlshm`` (Wayland only)
+    Shared memory video output driver without hardware acceleration that works
+    whenever Wayland is present.
+
+    .. note:: This is a fallback only, and should not be normally used.
